@@ -3,7 +3,6 @@ use std::io::{self, Read, Write};
 use duplicate::duplicate_item;
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio_chacha20::cursor::{DecryptResult, EncryptResult};
 
 use crate::{anti_replay::ValidatorRef, timestamp::TimestampMsg};
 
@@ -28,44 +27,33 @@ pub async fn decode_message<Reader>(
 where
     Reader: reader_bounds,
 {
-    let mut cursor = tokio_chacha20::cursor::DecryptCursor::new_x(key);
-
     // Read nonce
-    {
-        let size = cursor.remaining_nonce_size();
-        let buf = &mut write_msg.buf[..size];
-        let res = reader.read_exact(buf);
+    let mut cipher = {
+        let mut nonce = [0; tokio_chacha20::X_NONCE_BYTES];
+        let res = reader.read_exact(&mut nonce);
         add_await([res])?;
         if let Some(validator) = validator {
             match validator {
                 ValidatorRef::Replay(replay_validator) => {
-                    if !replay_validator.nonce_validates(buf.try_into().unwrap()) {
+                    if !replay_validator.nonce_validates(nonce) {
                         return Err(AeCodecError::Integrity);
                     }
                 }
                 ValidatorRef::Time(_) => {}
             }
         }
-        match cursor.decrypt(buf) {
-            DecryptResult::StillAtNonce => (),
-            DecryptResult::WithUserData { user_data_start: _ } => {
-                return Err(AeCodecError::Integrity);
-            }
-        }
-    }
+        tokio_chacha20::cipher::StreamCipher::new_x(key, nonce)
+    };
+    let otk = tokio_chacha20::mac::poly1305_key_gen(cipher.block().key(), cipher.block().nonce());
+    let mut hasher = tokio_chacha20::mac::Poly1305Hasher::new(&otk);
     // Decode message length
     let len = {
         let size = core::mem::size_of::<u32>();
         let buf = &mut write_msg.buf[..size];
         let res = reader.read_exact(buf);
         add_await([res])?;
-        let i = match cursor.decrypt(buf) {
-            DecryptResult::StillAtNonce => panic!(),
-            DecryptResult::WithUserData { user_data_start } => user_data_start,
-        };
-        if i != 0 {
-            return Err(AeCodecError::Integrity);
-        }
+        hasher.update(buf);
+        cipher.encrypt(buf);
         let len = u32::from_be_bytes(buf.try_into().unwrap()) as usize;
         let required_len = len + tokio_chacha20::mac::BLOCK_BYTES;
         if write_msg.buf.len() < required_len {
@@ -84,18 +72,15 @@ where
     };
     // Check MAC
     {
-        let key = cursor.poly1305_key().unwrap();
-        let expected_tag = tokio_chacha20::mac::poly1305_mac(key, msg_buf);
+        hasher.update(msg_buf);
+        let expected_tag = hasher.finalize();
         if tag != expected_tag {
             return Err(AeCodecError::Integrity);
         }
     }
     // Decode message
     {
-        match cursor.decrypt(msg_buf) {
-            DecryptResult::StillAtNonce => panic!(),
-            DecryptResult::WithUserData { user_data_start } => assert_eq!(user_data_start, 0),
-        }
+        cipher.encrypt(msg_buf);
         let mut rdr = io::Cursor::new(&msg_buf[..]);
         if let Some(validator) = validator {
             let mut timestamp_buf = [0; TimestampMsg::SIZE];
@@ -121,52 +106,52 @@ pub async fn encode_message<Writer>(
     writer: &mut Writer,
     key: [u8; tokio_chacha20::KEY_BYTES],
     timestamped: bool,
-    msg_buf: &mut [u8],
-    ciphertext_buf: &mut [u8],
+    buf: &mut [u8],
     write_message: impl Fn(&mut io::Cursor<&mut [u8]>) -> Result<(), AeCodecError>,
 ) -> Result<(), AeCodecError>
 where
     Writer: writer_bounds,
 {
-    let mut cursor = tokio_chacha20::cursor::EncryptCursor::new_x(key);
+    let mut buf_wtr = io::Cursor::new(buf);
+
+    // Write nonce
+    let mut cipher = {
+        let nonce: [u8; tokio_chacha20::X_NONCE_BYTES] = rand::random();
+        Write::write_all(&mut buf_wtr, &nonce[..])?;
+        tokio_chacha20::cipher::StreamCipher::new_x(key, nonce)
+    };
+
+    let len_start = usize::try_from(buf_wtr.position()).unwrap();
+    Write::write_all(&mut buf_wtr, &0_u32.to_be_bytes())?;
 
     // Encode message
-    let msg_buf: &[u8] = {
-        let mut msg_wtr = io::Cursor::new(&mut msg_buf[..]);
-        if timestamped {
-            let timestamp = TimestampMsg::now();
-            Write::write_all(&mut msg_wtr, &timestamp.encode()).unwrap();
-        }
-        write_message(&mut msg_wtr)?;
-        let len = msg_wtr.position();
-        &mut msg_buf[..len as usize]
-    };
-
-    let mut pos = 0;
+    let msg_start = usize::try_from(buf_wtr.position()).unwrap();
+    if timestamped {
+        let timestamp = TimestampMsg::now();
+        Write::write_all(&mut buf_wtr, &timestamp.encode())?;
+    }
+    write_message(&mut buf_wtr)?;
 
     // Write message length
+    let tag_start = usize::try_from(buf_wtr.position()).unwrap();
     {
-        let len = msg_buf.len() as u32;
-        let len = len.to_be_bytes();
-        let EncryptResult { read, written } = cursor.encrypt(&len, &mut ciphertext_buf[pos..]);
-        assert_eq!(len.len(), read);
-        pos += written;
+        let len = u32::try_from(usize::try_from(buf_wtr.position()).unwrap() - msg_start).unwrap();
+        buf_wtr.set_position(len_start as _);
+        Write::write_all(&mut buf_wtr, &len.to_be_bytes()[..])?;
+        buf_wtr.set_position(tag_start as _);
     }
-    // Write message
-    let encrypted_msg = {
-        let EncryptResult { read, written } = cursor.encrypt(msg_buf, &mut ciphertext_buf[pos..]);
-        assert_eq!(msg_buf.len(), read);
-        let encrypted_msg = &ciphertext_buf[pos..pos + written];
-        pos += written;
-        encrypted_msg
-    };
+    // Encrypt message length and message
+    let encrypt_range = len_start..tag_start;
+    cipher.encrypt(&mut buf_wtr.get_mut()[encrypt_range.clone()]);
     // Write tag
-    let key = cursor.poly1305_key();
-    let tag = tokio_chacha20::mac::poly1305_mac(key, encrypted_msg);
-    ciphertext_buf[pos..pos + tag.len()].copy_from_slice(&tag);
-    pos += tag.len();
+    let otk = tokio_chacha20::mac::poly1305_key_gen(cipher.block().key(), cipher.block().nonce());
+    let mut hasher = tokio_chacha20::mac::Poly1305Hasher::new(&otk);
+    hasher.update(&buf_wtr.get_ref()[encrypt_range.clone()]);
+    let tag = hasher.finalize();
+    Write::write_all(&mut buf_wtr, &tag[..])?;
+    let end = usize::try_from(buf_wtr.position()).unwrap();
 
-    add_await([writer.write_all(&ciphertext_buf[..pos])])?;
+    add_await([writer.write_all(&buf_wtr.get_ref()[..end])])?;
 
     Ok(())
 }
