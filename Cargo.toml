@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 duplicate = "2"
-primitive = { git = "https://github.com/Banyc/primitive.git", tag = "v0.0.59" }
+primitive = { git = "https://github.com/Banyc/primitive.git", tag = "v0.0.61" }
 rand = "0.9.1"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
